@@ -6,7 +6,7 @@ import json
 def get_combo_skims():
     # Production API endpoint for Kalshi
     url = "https://external-api.kalshi.com/trade-api/v2/markets"
-    # Filter for sports series (KXSPORTS)
+    # Filter for sports series 
     params = {"status": "open", "series_ticker": "KXSPORTS", "limit": 100}
     
     response = requests.get(url, params=params)
@@ -16,13 +16,13 @@ def get_combo_skims():
     markets = response.json().get("markets", [])
     now = datetime.now(timezone.utc)
     
-    # 1. Filter: Only games closing in the last 5 minutes or next 5 minutes
-    # (Adjust window as needed for 'live' games)
+    #Only games closing in the last 5 minutes or next 5 minutes
+   
     filtered = []
     for m in markets:
         close_time = datetime.fromisoformat(m['close_time'].replace('Z', '+00:00'))
         
-        # Check: Is it in the last 5 mins (-5m) or coming up soon?
+        # Check if last 5
         time_diff = (close_time - now).total_seconds()
         if -300 <= time_diff <= 300: 
             prob = max(m.get("yes_bid", 0), m.get("last_price", 0)) / 100.0
@@ -34,12 +34,12 @@ def get_combo_skims():
                     "ticker": m["ticker"]
                 })
 
-    # 2. Grouping: Logic to combo games at the same time
+    # Logic to combo games at the same time
     grouped = defaultdict(list)
     for game in filtered:
         grouped[game["close_time"]].append(game)
 
-    # 3. Format Output: Only return times with 2+ games (Combos)
+    #Only return times with 2+ games 
     combos = {k: v for k, v in grouped.items() if len(v) >= 2}
     
     if not combos:
