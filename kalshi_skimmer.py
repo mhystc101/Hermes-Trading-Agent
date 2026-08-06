@@ -1,81 +1,93 @@
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import json
 import os
+import subprocess
+import sys
 import requests
 
-
 def load_env_file(filepath='/opt/data/.env'):
-  """Simple zero-dependency helper to read key-value pairs from .env."""
-  if os.path.exists(filepath):
-    with open(filepath, 'r') as f:
-      for line in f:
-        line = line.strip()
-        if line and not line.startswith('#') and '=' in line:
-          key, value = line.split('=', 1)
-          os.environ[key.strip()] = value.strip().strip('"\'')
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    os.environ[key.strip()] = value.strip().strip('"\'')
 
+def scan_and_schedule_day_combos():
+    url = 'https://external-api.kalshi.com/trade-api/v2/markets'
+    params = {'status': 'open', 'series_ticker': 'KXSPORTS', 'limit': 200}
 
-def get_combo_skims():
-  # Production API endpoint for Kalshi
-  url = 'https://external-api.kalshi.com/trade-api/v2/markets'
-  params = {'status': 'open', 'series_ticker': 'KXSPORTS', 'limit': 100}
+    response = requests.get(url, params=params)
+    if response.status_code != 200:
+        return 'Error fetching schedule.'
 
-  response = requests.get(url, params=params)
-  if response.status_code != 200:
-    return 'Error fetching data from Kalshi.'
-
-  markets = response.json().get('markets', [])
-  now = datetime.now(timezone.utc)
-
-  #Games closing in the last 5 minutes or coming up soon
-  filtered = []
-  for m in markets:
-    close_time = datetime.fromisoformat(m['close_time'].replace('Z', '+00:00'))
-
-    time_diff = (close_time - now).total_seconds()
-    if -300 <= time_diff <= 300:
-      prob = max(m.get('yes_bid', 0), m.get('last_price', 0)) / 100.0
-      if prob >= 0.95:
-        filtered.append({
-            'title': m['title'],
-            'prob': prob,
-            'close_time': close_time.strftime('%H:%M UTC'),
+    markets = response.json().get('markets', [])
+    time_groups = defaultdict(list)
+    
+    for m in markets:
+        time_groups[m['close_time']].append({
             'ticker': m['ticker'],
+            'title': m['title'],
         })
 
- #Logic to combo games at the same time
-  grouped = defaultdict(list)
-  for game in filtered:
-    grouped[game['close_time']].append(game)
+    overlapping_schedules = {
+        close_time: games for close_time, games in time_groups.items() 
+        if len(games) >= 2
+    }
 
-  # Only return times with 2+ games 
-  combos = {k: v for k, v in grouped.items() if len(v) >= 2}
+    for close_iso, tickers in overlapping_schedules.items():
+        schedule_targeted_check(close_iso, tickers)
 
-  if not combos:
-    return (
-        'No high-probability (95%+) game combos found for the current time'
-        ' window.'
+    return overlapping_schedules
+
+def schedule_targeted_check(close_iso, tickers):
+    close_dt = datetime.fromisoformat(close_iso.replace('Z', '+00:00'))
+    at_time = close_dt.strftime('%H:%M')
+    
+    tickers_json = json.dumps(tickers).replace('"', '\\"')
+    cmd = (
+        f'echo "/opt/data/venv/bin/python /opt/data/kalshi_skimmer.py '
+        f'--check-tickers \\"{tickers_json}\\"" | at {at_time}'
     )
+    subprocess.run(cmd, shell=True)
 
-  return json.dumps(combos, indent=2)
+def check_specific_tickers(ticker_list):
+    high_prob_matches = []
 
+    for item in ticker_list:
+        ticker = item['ticker']
+        url = f'https://external-api.kalshi.com/trade-api/v2/markets/{ticker}'
+        response = requests.get(url)
+
+        if response.status_code == 200:
+            m = response.json().get('market', {})
+            prob = max(m.get('yes_bid', 0), m.get('last_price', 0)) / 100.0
+            if prob >= 0.95:
+                high_prob_matches.append({
+                    'title': m.get('title', item['title']),
+                    'prob': prob,
+                    'ticker': ticker,
+                })
+
+    return high_prob_matches if len(high_prob_matches) >= 2 else None
 
 def send_to_discord(content):
-  load_env_file()  
-  webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+    load_env_file()
+    webhook_url = os.getenv('DISCORD_WEBHOOK_URL')
+    if not webhook_url: return
 
-  if not webhook_url:
-    print('Warning: DISCORD_WEBHOOK_URL not set in environment or .env file.')
-    return
-
-  payload = {'content': f'📊 **Kalshi High-Probability Sports Combos**\n```json\n{content}\n```'}
-  response = requests.post(webhook_url, json=payload)
-  if response.status_code not in (200, 204):
-    print(f'Failed to post to Discord. Status code: {response.status_code}')
-
+    payload = {
+        'content': f'📊 **Kalshi 95%+ Combo Alert**\n```json\n{json.dumps(content, indent=2)}\n```'
+    }
+    requests.post(webhook_url, json=payload)
 
 if __name__ == '__main__':
-  result = get_combo_skims()
-  print(result)
-  send_to_discord(result)
+    if len(sys.argv) > 1 and sys.argv[1] == '--check-tickers':
+        target_tickers = json.loads(sys.argv[2])
+        combos = check_specific_tickers(target_tickers)
+        if combos:
+            send_to_discord(combos)
+    else:
+        scan_and_schedule_day_combos()
